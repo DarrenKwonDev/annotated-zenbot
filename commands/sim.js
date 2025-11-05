@@ -52,13 +52,35 @@ module.exports = function (program, conf) {
     .option('--verbose', 'print status lines on every period')
     .option('--silent', 'only output on completion (can speed up sim)')
     .action(function (selector, cmd) {
-      var s = { options: minimist(process.argv) }
+
+      // 1. getNext() 시작
+      //    ↓
+      // 2. MongoDB에서 100개 거래 조회
+      //    ↓
+      // 3. 스트림으로 하나씩 처리
+      //    ↓
+      // 4. 각 거래를 eventBus.emit('trade', trade)
+      //    ↓
+      // 5. engine이 트레이드 받아서 처리
+      //    ↓
+      // 6. 100개 모두 처리되면 onCollectionCursorEnd()
+      //    ↓
+      // 7. cursor 업데이트 후 getNext() 재귀 호출
+      //    ↓
+      // 8. 더 이상 데이터 없으면 시뮬레이션 종료
+      
+      // s = {options, balance, lookback, exchnage ...etc }
+      var s = { options: minimist(process.argv) } 
+
       var so = s.options
+
       if (!so.quarentine_time) {
         so.quarentine_time = 0
       }
 
+      // Minimist 부산물 정리
       delete so._
+
       if (cmd.conf) {
         var overrides = require(path.resolve(process.cwd(), cmd.conf))
         Object.keys(overrides).forEach(function (k) {
@@ -70,9 +92,12 @@ module.exports = function (program, conf) {
           so[k] = cmd[k]
         }
       })
+
+      // collectionService -> mongodb service container
       var tradesCollection = collectionService(conf).getTrades()
       var simResults = collectionService(conf).getSimResults()
 
+      // 전역적으로 사용할 eventEmitter
       var eventBus = conf.eventBus
 
       if (so.start) {
@@ -105,12 +130,18 @@ module.exports = function (program, conf) {
       var cursor, reversing, reverse_point
       var query_start = so.start ? tb(so.start).resize(so.period_length).subtract(so.min_periods + 2).toMilliseconds() : null
 
+
+      // ---------------------------------------------------------------
       function exitSim () {
         console.log()
+
+        // 기간 자체 없는 경우 
         if (!s.period) {
           console.error('no trades found! try running `zenbot backfill ' + so.selector.normalized + '` first')
           process.exit(1)
         }
+
+        // option 기반 필요한 세팅들 
         var option_keys = Object.keys(so)
         var output_lines = []
         option_keys.sort(function (a, b) {
@@ -133,23 +164,23 @@ module.exports = function (program, conf) {
             time: s.period.time
           })
         }
+        //
         s.balance.currency = n(s.net_currency).add(n(s.period.close).multiply(s.balance.asset)).format('0.00000000')
-
         s.balance.asset = 0
+        //
         s.lookback.unshift(s.period)
+
+        // 
         var profit = s.start_capital ? n(s.balance.currency).subtract(s.start_capital).divide(s.start_capital) : n(0)
         output_lines.push('end balance: ' + n(s.balance.currency).format('0.00000000').yellow + ' (' + profit.format('0.00%') + ')')
-        //console.log('start_capital', s.start_capital)
-        //console.log('start_price', n(s.start_price).format('0.00000000'))
-        //console.log('close', n(s.period.close).format('0.00000000'))
         var buy_hold = s.start_price ? n(s.period.close).multiply(n(s.start_capital).divide(s.start_price)) : n(s.balance.currency)
-        //console.log('buy hold', buy_hold.format('0.00000000'))
         var buy_hold_profit = s.start_capital ? n(buy_hold).subtract(s.start_capital).divide(s.start_capital) : n(0)
         output_lines.push('buy hold: ' + buy_hold.format('0.00000000').yellow + ' (' + n(buy_hold_profit).format('0.00%') + ')')
         output_lines.push('vs. buy hold: ' + n(s.balance.currency).subtract(buy_hold).divide(buy_hold).format('0.00%').yellow)
         output_lines.push(s.my_trades.length + ' trades over ' + s.day_count + ' days (avg ' + n(s.my_trades.length / s.day_count).format('0.00') + ' trades/day)')
         var last_buy
         var losses = 0, sells = 0
+
         s.my_trades.forEach(function (trade) {
           if (trade.type === 'buy') {
             last_buy = trade.price
@@ -189,8 +220,8 @@ module.exports = function (program, conf) {
           console.log(line)
         })
 
-        if (so.backtester_generation >= 0)
-        {
+        // 성과 저장 
+        if (so.backtester_generation >= 0) {
           var file_name = so.strategy.replace('_','')+'_'+ so.selector.normalized.replace('_','').toLowerCase()+'_'+so.backtester_generation
           fs.writeFileSync(path.resolve(__dirname, '..', 'simulations','sim_'+file_name+'.json'),options_json, {encoding: 'utf8'})
           var trades_json = JSON.stringify(s.my_trades, null, 2)
@@ -201,6 +232,7 @@ module.exports = function (program, conf) {
           })
         }
 
+        // html 방식의 리포트 생성
         if (so.filename !== 'none') {
           var html_output = output_lines.map(function (line) {
             return colors.stripColors(line)
@@ -226,6 +258,7 @@ module.exports = function (program, conf) {
           console.log('wrote', out_target)
         }
 
+        // collection 에 넣기  
         simResults.insertOne(options_output)
           .then(() => {
             process.exit(0)
@@ -236,6 +269,8 @@ module.exports = function (program, conf) {
           })
       }
 
+      // ---------------------------------------------------------------
+      // 백테스팅 진행 -> trades을 하나씩 불러와서 emit 처리 함 -> 전략 트리거가 trades 로만 되는 건가본데? 
       var getNext = async () => {
         var opts = {
           query: {
@@ -245,9 +280,13 @@ module.exports = function (program, conf) {
           limit: 100,
           timeout: false
         }
+
+        // so.send 이전만
         if (so.end) {
           opts.query.time = { $lte: so.end }
         }
+
+        // cursor는 마지막으로 처리한 이후가 있을 때 (getNext의 다음 호출)
         if (cursor) {
           if (reversing) {
             opts.query.time = {}
@@ -260,22 +299,28 @@ module.exports = function (program, conf) {
             if (!opts.query.time) opts.query.time = {}
             opts.query.time['$gt'] = cursor
           }
-        } else if (query_start) {
-          if (!opts.query.time) opts.query.time = {}
-          opts.query.time['$gte'] = query_start
         }
+        // 최초 호출시 여기가 걸린다 
+        else if (query_start) {
+          if (!opts.query.time) opts.query.time = {}
+          opts.query.time['$gte'] = query_start // query_start한 이후의 시간을 쿼리해온다
+        }
+
+        // 옵션 기반 필요한 trades를 가져온다 
         var collectionCursor = tradesCollection
           .find(opts.query)
           .sort(opts.sort)
           .limit(opts.limit)
 
-        var totalTrades = await collectionCursor.count(true)
-        const collectionCursorStream = collectionCursor.stream()
+        var totalTrades = await collectionCursor.count(true) // 전체 거래 수 계산  
+        const collectionCursorStream = collectionCursor.stream() // 스트림 생성
 
         var numTrades = 0
         var lastTrade
 
+        // cursor가 끝날 때마다 트리거 
         var onCollectionCursorEnd = () => {
+
           if (numTrades === 0) {
             if (so.symmetrical && !reversing) {
               reversing = true
@@ -295,25 +340,41 @@ module.exports = function (program, conf) {
           return getNext()
         }
 
+        // 만약 db에 저장된 trades 자체가 0라면
         if(totalTrades === 0) {
           onCollectionCursorEnd()
         }
 
+        //  query, sort, limit 적용한 collection data stream에서 하나씩 빼가면서 돌려본다 
         collectionCursorStream.on('data', function(trade) {
           lastTrade = trade
           numTrades++
+
           if (so.symmetrical && reversing) {
             trade.orig_time = trade.time
             trade.time = reverse_point + (reverse_point - trade.time)
           }
+
+          // 이벤트 버스가 trade를 흘려 보낸다. 'trade' 를 리스닝하고 있는 engine에서 트리거 된다
+          // 1. sim.js: eventBus.emit('trade', trade)
+          //    ↓
+          // 2. engine.js: eventBus.on('trade', queueTrade)
+          //    ↓
+          // 3. engine.js: queueTrade → onTrade
+          //    ↓
+          // 4. engine.js: onTrade → updatePeriod
+          //    ↓
+          // 5. engine.js: updatePeriod → strategy.onPeriod
           eventBus.emit('trade', trade)
 
+          // trade를 모두 다 돌았다면
           if (numTrades && totalTrades && totalTrades == numTrades) {
             onCollectionCursorEnd()
           }
-        })
+        }
+        )
       }
 
-      return getNext()
-    })
+    return getNext()
+  })
 }

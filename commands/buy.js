@@ -6,6 +6,8 @@ var minimist = require('minimist')
   , engineFactory = require('../lib/engine')
   , _ = require('lodash')
 
+
+// commands의 conf는 zenbot.js에서 동일하게 conf를 주입받아 사용한다  
 module.exports = function (program, conf) {
   program
     .command('buy [selector]')
@@ -20,6 +22,7 @@ module.exports = function (program, conf) {
     .option('--max_slippage_pct <pct>', 'avoid buying at a slippage pct above this float', conf.max_slippage_pct)
     .option('--debug', 'output detailed debug info')
     .action(function (selector, cmd) {
+      // --------------------------------------------
       var s = {options: minimist(process.argv)}
       var so = s.options
       delete so._
@@ -38,7 +41,11 @@ module.exports = function (program, conf) {
       so.mode = 'live'
       so.strategy = conf.strategy
       so.stats = true
+
+      // --------------------------------------------
       var engine = engineFactory(s, conf)
+
+      // function executeSignal(signal, _cb, size, is_reorder, is_taker, reverseCalled)
       engine.executeSignal('buy', function (err, order) {
         if (err) {
           console.error(err)
@@ -49,8 +56,11 @@ module.exports = function (program, conf) {
         }
         process.exit()
       }, cmd.size)
+
+      // 주문 체크  
       function checkOrder () {
         if (!_.isEmpty(s.api_order)) {
+
           s.exchange.getQuote({product_id: s.product_id}, function (err, quote) {
             if (err) {
               throw err
@@ -62,6 +72,8 @@ module.exports = function (program, conf) {
           console.log('placing order...')
         }
       }
+
+      // 
       setInterval(checkOrder, conf.order_poll_time)
     })
 }
